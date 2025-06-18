@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>To-Do List with Authentication</title>
+    <style>
+        body { font-family: Arial, sans-serif; }
+        #todoList { border-collapse: collapse; width: 70%; margin: 0 auto; }
+        #todoList th, #todoList td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        #todoList th { background-color: #f0f0f0; }
+        #todoList th:first-child, #todoList th:last-child { width: 5%; }
+        #todoList th:nth-child(2) { width: 90%; }
+        .add-form { margin-top: 20px; width: 70%; margin: 20px auto; }
+        .add-form input[type="text"] { padding: 8px; width: 70%; }
+        .add-form button { padding: 8px; width: 20%; }
+        #authSection { text-align: center; margin: 20px; }
+        #logoutBtn { margin: 20px auto; display: block; }
+    </style>
+</head>
+<body>
+
+<div id="authSection">
+    <div id="loginForm">
+        <input type="email" id="loginEmail" placeholder="Email">
+        <input type="password" id="loginPassword" placeholder="Password">
+        <button onclick="login()">Login</button>
+        <button onclick="showRegister()">Register</button>
+    </div>
+    <div id="registerForm" style="display: none;">
+        <input type="email" id="registerEmail" placeholder="Email">
+        <input type="password" id="registerPassword" placeholder="Password">
+        <button onclick="register()">Create Account</button>
+        <button onclick="showLogin()">Back to Login</button>
+    </div>
+</div>
+
+<h2 style="text-align: center;" id="mainTitle" hidden>To-Do List</h2>
+
+<table id="todoList" hidden>
+    <thead>
+        <tr>
+            <th>Number</th>
+            <th>Text</th>
+            <th>Action</th>
+        </tr>
+    </thead>
+    <tbody id="listBody">
+        <!-- Filled by JS -->
+    </tbody>
+</table>
+
+<div class="add-form" id="addForm" hidden>
+    <input type="text" id="newItem" placeholder="Enter new item">
+    <button onclick="addItem()">Add</button>
+</div>
+
+<button id="logoutBtn" onclick="logout()" hidden>Logout</button>
+
+<script>
+let isAuthenticated = false;
+
+// --- Authentication UI ---
+function showRegister() {
+    document.getElementById('loginForm').style.display = 'none';
+    document.getElementById('registerForm').style.display = 'block';
+}
+function showLogin() {
+    document.getElementById('registerForm').style.display = 'none';
+    document.getElementById('loginForm').style.display = 'block';
+}
+async function register() {
+    const email = document.getElementById('registerEmail').value;
+    const password = document.getElementById('registerPassword').value;
+    const response = await fetch('/api/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ email, password })
+    });
+    if (response.ok) {
+        alert('Registration successful! Please login.');
+        showLogin();
+    } else {
+        alert('Registration failed.');
+    }
+}
+async function login() {
+    const email = document.getElementById('loginEmail').value;
+    const password = document.getElementById('loginPassword').value;
+    const response = await fetch('/api/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ email, password })
+    });
+    if (response.ok) {
+        isAuthenticated = true;
+        document.getElementById('authSection').style.display = 'none';
+        document.getElementById('mainTitle').hidden = false;
+        document.getElementById('todoList').hidden = false;
+        document.getElementById('addForm').hidden = false;
+        document.getElementById('logoutBtn').hidden = false;
+        loadItems();
+    } else {
+        alert('Login failed.');
+    }
+}
+async function logout() {
+    await fetch('/api/logout', { method: 'POST', credentials: 'same-origin' });
+    location.reload();
+}
+
+// --- To-Do List Functions ---
+async function loadItems() {
+    const res = await fetch('/api/items', { credentials: 'same-origin' });
+    if (!res.ok) return;
+    const items = await res.json();
+    const listBody = document.getElementById('listBody');
+    listBody.innerHTML = '';
+    items.forEach((item, idx) => {
+        const row = document.createElement('tr');
+        row.innerHTML = `
+            <td>${idx + 1}</td>
+            <td>${item.text}</td>
+            <td><button onclick="removeItem(${item.id})">Remove</button></td>
+        `;
+        listBody.appendChild(row);
+    });
+}
+async function addItem() {
+    const newItemInput = document.getElementById('newItem');
+    const newItemText = newItemInput.value.trim();
+    if (!newItemText) return;
+    const res = await fetch('/api/items', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ text: newItemText })
+    });
+    if (res.ok) {
+        newItemInput.value = '';
+        loadItems();
+    } else {
+        alert('Failed to add item.');
+    }
+}
+async function removeItem(id) {
+    const res = await fetch(`/api/items/${id}`, { method: 'DELETE', credentials: 'same-origin' });
+    if (res.ok) loadItems();
+    else alert('Failed to remove item.');
+}
+
+// --- Check Auth on Page Load ---
+window.onload = async function () {
+    const res = await fetch('/api/check-auth', { credentials: 'same-origin' });
+    const data = await res.json();
+    if (data.authenticated) {
+        isAuthenticated = true;
+        document.getElementById('authSection').style.display = 'none';
+        document.getElementById('mainTitle').hidden = false;
+        document.getElementById('todoList').hidden = false;
+        document.getElementById('addForm').hidden = false;
+        document.getElementById('logoutBtn').hidden = false;
+        loadItems();
+    }
+};
+</script>
+</body>
+</html>
