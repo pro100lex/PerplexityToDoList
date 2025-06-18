@@ -1,23 +1,29 @@
-const http = require('http');
+const express = require('express');
+const bodyParser = require('body-parser');
 const fs = require('fs');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cookie = require('cookie');
+const TelegramBot = require('node-telegram-bot-api');
 
-const PORT = 3000;
-const JWT_SECRET = 'your_super_secret_key';
+// --- CONFIG ---
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'your_super_secret_key';
+const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN || 'YOUR_TELEGRAM_BOT_TOKEN';
+const URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 
-// Open (or create) the SQLite database
+// --- DATABASE ---
 const db = new sqlite3.Database('database.db');
 
-// Run schema creation on startup
+// Create tables if not exist
 db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        email TEXT UNIQUE NOT NULL,
-        password_hash TEXT NOT NULL,
+        email TEXT UNIQUE,
+        password_hash TEXT,
+        telegram_id INTEGER UNIQUE,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )`);
     db.run(`CREATE TABLE IF NOT EXISTS items (
@@ -29,19 +35,14 @@ db.serialize(() => {
     )`);
 });
 
+// --- EXPRESS APP ---
+const app = express();
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({ extended: false }));
+
+// --- AUTH HELPERS ---
 function send(res, status, data, headers = {}) {
-    res.writeHead(status, Object.assign({'Content-Type': 'application/json'}, headers));
-    res.end(JSON.stringify(data));
-}
-function parseBody(req) {
-    return new Promise(resolve => {
-        let body = '';
-        req.on('data', chunk => body += chunk);
-        req.on('end', () => {
-            try { resolve(JSON.parse(body)); }
-            catch { resolve({}); }
-        });
-    });
+    res.status(status).set(Object.assign({'Content-Type': 'application/json'}, headers)).send(JSON.stringify(data));
 }
 function getUserFromReq(req) {
     const cookies = cookie.parse(req.headers.cookie || '');
@@ -54,125 +55,100 @@ function getUserFromReq(req) {
     }
 }
 
-async function handleRequest(req, res) {
-    if (req.method === 'GET' && (req.url === '/' || req.url.startsWith('/index.html'))) {
-        const html = await fs.promises.readFile(path.join(__dirname, 'index.html'), 'utf8');
-        res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end(html);
-        return;
-    }
+// --- WEB ROUTES ---
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'index.html'));
+});
 
-    // Registration
-    if (req.url === '/api/register' && req.method === 'POST') {
-        const { email, password } = await parseBody(req);
-        if (!email || !password) return send(res, 400, { error: 'Missing fields' });
-        const hash = await bcrypt.hash(password, 10);
-        db.run('INSERT INTO users (email, password_hash) VALUES (?, ?)', [email, hash], function(err) {
-            if (err) return send(res, 400, { error: 'Registration failed' });
-            send(res, 201, { success: true });
-        });
-        return;
-    }
-
-    // Login
-    if (req.url === '/api/login' && req.method === 'POST') {
-        const { email, password } = await parseBody(req);
-        if (!email || !password) return send(res, 400, { error: 'Missing fields' });
-        db.get('SELECT * FROM users WHERE email = ?', [email], async (err, user) => {
-            if (err || !user) return send(res, 401, { error: 'Invalid credentials' });
-            if (!(await bcrypt.compare(password, user.password_hash))) return send(res, 401, { error: 'Invalid credentials' });
-            const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '1h' });
-            res.writeHead(200, {
-                'Content-Type': 'application/json',
-                'Set-Cookie': cookie.serialize('jwt', token, {
-                    httpOnly: true,
-                    maxAge: 3600,
-                    sameSite: 'lax',
-                    path: '/',
-                })
-            });
-            res.end(JSON.stringify({ success: true }));
-        });
-        return;
-    }
-
-    // Logout
-    if (req.url === '/api/logout' && req.method === 'POST') {
-        res.writeHead(200, {
-            'Content-Type': 'application/json',
-            'Set-Cookie': cookie.serialize('jwt', '', {
-                httpOnly: true,
-                maxAge: 0,
-                sameSite: 'lax',
-                path: '/',
-            })
-        });
-        res.end(JSON.stringify({ success: true }));
-        return;
-    }
-
-    // Check Auth
-    if (req.url === '/api/check-auth' && req.method === 'GET') {
-        const user = getUserFromReq(req);
-        send(res, 200, { authenticated: !!user });
-        return;
-    }
-
-    // Get To-Do Items
-    if (req.url === '/api/items' && req.method === 'GET') {
-        const user = getUserFromReq(req);
-        if (!user) return send(res, 401, { error: 'Unauthorized' });
-        db.all('SELECT id, text FROM items WHERE user_id = ?', [user.userId], (err, rows) => {
-            if (err) return send(res, 500, { error: 'DB error' });
-            send(res, 200, rows);
-        });
-        return;
-    }
-
-    // Add To-Do Item
-    if (req.url === '/api/items' && req.method === 'POST') {
-        const user = getUserFromReq(req);
-        if (!user) return send(res, 401, { error: 'Unauthorized' });
-        const { text } = await parseBody(req);
-        if (!text) return send(res, 400, { error: 'Missing text' });
-        db.run('INSERT INTO items (text, user_id) VALUES (?, ?)', [text, user.userId], function(err) {
-            if (err) return send(res, 500, { error: 'DB error' });
-            send(res, 201, { success: true });
-        });
-        return;
-    }
-
-    // Delete To-Do Item
-    if (req.url.startsWith('/api/items/') && req.method === 'DELETE') {
-        const user = getUserFromReq(req);
-        if (!user) return send(res, 401, { error: 'Unauthorized' });
-        const id = req.url.split('/').pop();
-        db.run('DELETE FROM items WHERE id = ? AND user_id = ?', [id, user.userId], function(err) {
-            if (err) return send(res, 500, { error: 'DB error' });
-            send(res, 200, { success: true });
-        });
-        return;
-    }
-
-    send(res, 404, { error: 'Not found' });
-}
-
-const server = http.createServer((req, res) => {
-    handleRequest(req, res).catch(e => {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Internal Server Error' }));
+// Registration
+app.post('/api/register', async (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) return send(res, 400, { error: 'Missing fields' });
+    const hash = await bcrypt.hash(password, 10);
+    db.run('INSERT INTO users (email, password_hash) VALUES (?, ?)', [email, hash], function(err) {
+        if (err) return send(res, 400, { error: 'Registration failed' });
+        send(res, 201, { success: true });
     });
 });
-server.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
 
-const TelegramBot = require('node-telegram-bot-api'); // <-- This is required!
+// Login
+app.post('/api/login', async (req, res) => {
+    const { email, password } = req.body;
+    if (!email || !password) return send(res, 400, { error: 'Missing fields' });
+    db.get('SELECT * FROM users WHERE email = ?', [email], async (err, user) => {
+        if (err || !user) return send(res, 401, { error: 'Invalid credentials' });
+        if (!(await bcrypt.compare(password, user.password_hash))) return send(res, 401, { error: 'Invalid credentials' });
+        const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '1h' });
+        res.status(200)
+            .cookie('jwt', token, { httpOnly: true, maxAge: 3600 * 1000, sameSite: 'lax', path: '/' })
+            .json({ success: true });
+    });
+});
 
-const token = '7966439372:AAGAYa42pOFjazMKopk2dpWEDFnvvjbSRrU';
-const bot = new TelegramBot(token, { polling: true });
+// Logout
+app.post('/api/logout', (req, res) => {
+    res.status(200)
+        .cookie('jwt', '', { httpOnly: true, maxAge: 0, sameSite: 'lax', path: '/' })
+        .json({ success: true });
+});
 
+// Check Auth
+app.get('/api/check-auth', (req, res) => {
+    const user = getUserFromReq(req);
+    send(res, 200, { authenticated: !!user });
+});
+
+// Get To-Do Items
+app.get('/api/items', (req, res) => {
+    const user = getUserFromReq(req);
+    if (!user) return send(res, 401, { error: 'Unauthorized' });
+    db.all('SELECT id, text FROM items WHERE user_id = ?', [user.userId], (err, rows) => {
+        if (err) return send(res, 500, { error: 'DB error' });
+        send(res, 200, rows);
+    });
+});
+
+// Add To-Do Item
+app.post('/api/items', (req, res) => {
+    const user = getUserFromReq(req);
+    if (!user) return send(res, 401, { error: 'Unauthorized' });
+    const { text } = req.body;
+    if (!text) return send(res, 400, { error: 'Missing text' });
+    db.run('INSERT INTO items (text, user_id) VALUES (?, ?)', [text, user.userId], function(err) {
+        if (err) return send(res, 500, { error: 'DB error' });
+        send(res, 201, { success: true });
+    });
+});
+
+// Delete To-Do Item
+app.delete('/api/items/:id', (req, res) => {
+    const user = getUserFromReq(req);
+    if (!user) return send(res, 401, { error: 'Unauthorized' });
+    const id = req.params.id;
+    db.run('DELETE FROM items WHERE id = ? AND user_id = ?', [id, user.userId], function(err) {
+        if (err) return send(res, 500, { error: 'DB error' });
+        send(res, 200, { success: true });
+    });
+});
+
+// --- TELEGRAM BOT WEBHOOK SETUP ---
+const bot = new TelegramBot(TELEGRAM_BOT_TOKEN, { webHook: { port: false } }); // We'll attach to Express manually
+
+const webhookPath = `/bot${TELEGRAM_BOT_TOKEN}`;
+const webhookURL = `${URL}${webhookPath}`;
+
+// Set webhook on startup
+bot.setWebHook(webhookURL);
+
+// Attach webhook endpoint to Express
+app.post(webhookPath, (req, res) => {
+    bot.processUpdate(req.body);
+    res.sendStatus(200);
+});
+
+// Telegram bot logic
 bot.onText(/\/start/, (msg) => {
     bot.sendMessage(msg.chat.id, 'Welcome to your Telegram To-Do Bot!\nUse /add <task> to add a to-do.\nUse /list to see your to-dos.');
-    // Optionally, register Telegram user in users table if not already present
     db.get('SELECT * FROM users WHERE telegram_id = ?', [msg.from.id], (err, user) => {
         if (!user) {
             db.run('INSERT INTO users (telegram_id) VALUES (?)', [msg.from.id]);
@@ -182,7 +158,6 @@ bot.onText(/\/start/, (msg) => {
 
 bot.onText(/\/add (.+)/, (msg, match) => {
     const todoText = match[1];
-    // Ensure user exists in users table
     db.get('SELECT * FROM users WHERE telegram_id = ?', [msg.from.id], (err, user) => {
         if (!user) {
             db.run('INSERT INTO users (telegram_id) VALUES (?)', [msg.from.id], function(err) {
@@ -216,4 +191,10 @@ bot.onText(/\/list/, (msg) => {
             });
         }
     });
+});
+
+// --- START SERVER ---
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Telegram webhook set to: ${webhookURL}`);
 });
